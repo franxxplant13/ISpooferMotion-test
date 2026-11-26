@@ -44,7 +44,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20.19.5
+          node-version: 24
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -148,7 +148,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: 20.19.5
+          node-version: 24
 
       - name: Download artifacts
         uses: actions/download-artifact@v4

@@ -255,7 +255,11 @@ async function fetchSingleAssetDetail(id, placeId, session, attempt = 1) {
     const signal =
       typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(15_000) : undefined;
     const fetchFn = session ? (u, o) => session.fetch(u, o) : fetch;
-    const response = await fetchFn(url, { headers, signal, includeCookie: false });
+    const response = await fetchFn(url, {
+      headers,
+      signal,
+      includeCookie: false,
+    });
 
     if (response.status === 429 && attempt <= 1) {
       await new Promise((r) => setTimeout(r, 500));
@@ -425,7 +429,9 @@ async function handleScanPayload(payload, callbacks) {
         `Resolving ${rawIds.length} candidate ID${rawIds.length === 1 ? '' : 's'}...`,
       );
       try {
-        const cookie = await getCookieFromAutoDetect();
+        const allowCookieAccess =
+          !callbacks.getAuthMode || (await callbacks.getAuthMode()) !== 'apiKey';
+        const cookie = allowCookieAccess ? await getCookieFromAutoDetect() : undefined;
 
         let fallbackCreator = { creatorType: 'User', creatorId: '' };
 
@@ -437,10 +443,16 @@ async function handleScanPayload(payload, callbacks) {
             const resolvedPlaceId = await getPlaceIdFromUniverseId(gameId, cookie);
             if (resolvedPlaceId) {
               placeId = resolvedPlaceId;
-              if (DEVELOPER_MODE) console.log(`[LocalhostPlugin] Instantly resolved GameId ${gameId} to PlaceId ${placeId}`);
+              if (DEVELOPER_MODE)
+                console.log(
+                  `[LocalhostPlugin] Instantly resolved GameId ${gameId} to PlaceId ${placeId}`,
+                );
             }
           } catch (e) {
-            console.warn(`[LocalhostPlugin] Failed to resolve GameId ${gameId} to PlaceId`, e.message);
+            console.warn(
+              `[LocalhostPlugin] Failed to resolve GameId ${gameId} to PlaceId`,
+              e.message,
+            );
           }
         }
 
@@ -469,8 +481,8 @@ async function handleScanPayload(payload, callbacks) {
           }
         }
 
-        if (cookie) {
-          const session = createRobloxSession(cookie);
+        if (cookie || !allowCookieAccess) {
+          const session = cookie ? createRobloxSession(cookie) : null;
           assets = await batchResolveMetadata(
             rawIds,
             kind,
@@ -518,9 +530,7 @@ async function handleScanPayload(payload, callbacks) {
 
     const text = assets.length > 0 ? formatAssetsForInput(assets, kind) : '';
     const lines = text
-      ? text
-          .split(/\r?\n/)
-          .filter((line) => line && !/^--\s*\[\[\s*TYPE\s*:/i.test(line.trim()))
+      ? text.split(/\r?\n/).filter((line) => line && !/^--\s*\[\[\s*TYPE\s*:/i.test(line.trim()))
       : [];
     const count = lines.length;
 
@@ -552,7 +562,13 @@ async function handleScanPayload(payload, callbacks) {
     if (DEVELOPER_MODE) console.error('[LocalhostPlugin] Background scan processing failed:', err);
   });
 
-  return { ok: true, delivered: true, count: rawIds.length, kind, port: activePort };
+  return {
+    ok: true,
+    delivered: true,
+    count: rawIds.length,
+    kind,
+    port: activePort,
+  };
 }
 
 function extractReplacementPairs(text) {
@@ -601,6 +617,8 @@ function startLocalhostPluginServer(callbacks, options = {}) {
   activePort = basePort;
 
   const safeCallbacks = {
+    getAuthMode:
+      typeof callbacks?.getAuthMode === 'function' ? callbacks.getAuthMode : () => 'cookie',
     sendScanResults:
       typeof callbacks?.sendScanResults === 'function' ? callbacks.sendScanResults : () => false,
     sendStatusMessage:
@@ -732,6 +750,7 @@ module.exports = {
   stopLocalhostPluginServer,
   pushReplacement,
   __private: {
+    handleScanPayload,
     appendPlaceContextToLine,
     formatAssetsForInput,
     normalizeAssets,

@@ -8,6 +8,7 @@ export default function ProfilesView({ isActive }: { isActive: boolean }) {
 
   const [profileName, setProfileName] = useState('');
   const [cookie, setCookie] = useState('');
+  const [authMode, setAuthMode] = useState('apiKey');
   const [autoDetectCookie, setAutoDetectCookie] = useState(true);
   const [groupId, setGroupId] = useState('');
   const [apiKey, setApiKey] = useState('');
@@ -21,7 +22,11 @@ export default function ProfilesView({ isActive }: { isActive: boolean }) {
 
   useEffect(() => {
     loadProfiles();
-    return () => clearTimeout(deleteTimeoutRef.current);
+    window.addEventListener('profile-changed', loadProfiles);
+    return () => {
+      clearTimeout(deleteTimeoutRef.current);
+      window.removeEventListener('profile-changed', loadProfiles);
+    };
   }, []);
 
   async function loadProfiles() {
@@ -46,12 +51,17 @@ export default function ProfilesView({ isActive }: { isActive: boolean }) {
     setDeleteState(null);
     const profile = allProfiles[id];
     if (profile) {
+      setAuthMode(profile.authMode ?? 'cookie');
       setProfileName(profile.name || 'Unnamed Profile');
       setCookie(profile.cookie || '');
       setAutoDetectCookie(profile.autoDetectCookie ?? true);
       setGroupId(profile.groupId || '');
       setApiKey(profile.apiKey || '');
-      fetchRobloxData(profile.cookie, profile.groupId, id, profile.autoDetectCookie ?? true);
+      if (profile.authMode !== 'apiKey') {
+        fetchRobloxData(profile.cookie, profile.groupId, id, profile.autoDetectCookie ?? true);
+      } else {
+        setRobloxData(null);
+      }
     } else {
       setRobloxData(null);
     }
@@ -119,7 +129,7 @@ export default function ProfilesView({ isActive }: { isActive: boolean }) {
 
     window.dispatchEvent(new Event('profile-changed'));
 
-    if (normalizedUpdates.cookie !== undefined || normalizedUpdates.groupId !== undefined || normalizedUpdates.autoDetectCookie !== undefined) {
+    if (newProfiles[activeId].authMode !== 'apiKey' && (normalizedUpdates.cookie !== undefined || normalizedUpdates.groupId !== undefined || normalizedUpdates.autoDetectCookie !== undefined)) {
       const p = newProfiles[activeId];
       fetchRobloxData(p.cookie, p.groupId, activeId, p.autoDetectCookie ?? true);
     }
@@ -130,6 +140,7 @@ export default function ProfilesView({ isActive }: { isActive: boolean }) {
     const newProfile = {
       name: makeUniqueProfileName('New Profile'),
       cookie: '',
+      authMode: 'apiKey',
       autoDetectCookie: true,
       apiKey: '',
       groupId: '',
@@ -276,14 +287,15 @@ export default function ProfilesView({ isActive }: { isActive: boolean }) {
                 <Text fontSize="12px" color="discord.darkMuted" textTransform="uppercase" fontWeight={800} letterSpacing="0.5px">Roblox Cookie</Text>
                 <HStack>
                   <Text fontSize="12px" color="discord.text" fontWeight={500}>Auto Detect</Text>
-                  <Switch size="sm" colorScheme="brand" isChecked={autoDetectCookie} onChange={(e) => updateProfile({ autoDetectCookie: e.target.checked })} />
+                  <Switch size="sm" colorScheme="brand" isChecked={autoDetectCookie} isDisabled={authMode === 'apiKey'} onChange={(e) => updateProfile({ autoDetectCookie: e.target.checked })} />
                 </HStack>
               </HStack>
+              {authMode === 'apiKey' && <Text fontSize="12px" color="discord.muted" mb="8px">API-key-only mode is selected in Quick Setup.</Text>}
               <Input
                 type="password"
                 placeholder="WARNING: Do not share your cookie"
                 value={cookie}
-                disabled={autoDetectCookie}
+                disabled={autoDetectCookie || authMode === 'apiKey'}
                 onChange={(e) => updateProfile({ cookie: e.target.value })}
                 bg="discord.input" border="none" color="discord.text" borderRadius="4px" h="40px" fontSize="14px"
                 _focus={{ boxShadow: 'none' }}
@@ -326,7 +338,7 @@ export default function ProfilesView({ isActive }: { isActive: boolean }) {
             </Box>
           </VStack>
 
-          {(!!cookie || autoDetectCookie) && (
+          {authMode === 'cookie' && (!!cookie || autoDetectCookie) && (
             <HStack bg="discord.input" borderRadius="8px" p="20px" spacing="24px" align="center" mt="8px" border="1px solid" borderColor="discord.border">
               <HStack spacing="16px">
                 {robloxData?.user?.avatarUrl ? <Avatar src={robloxData.user.avatarUrl} size="md" /> : <Box w="48px" h="48px" borderRadius="24px" bg="discord.card" />}

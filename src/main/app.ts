@@ -1,7 +1,7 @@
 const path = require('node:path');
 const { app } = require('electron');
 const { setupAppLifecycle, getMainWindow } = require('./window');
-const { registerIpcHandlers } = require('./services/ipc-handlers');
+const { registerIpcHandlers, getActiveAuthMode } = require('./services/ipc-handlers');
 const { DEVELOPER_MODE, initializeFileLogging } = require('./services/common');
 const {
   startLocalhostPluginServer,
@@ -88,6 +88,7 @@ function bootstrap() {
   return setupAppLifecycle().then(() => {
     startLocalhostPluginServer({
       sendScanResults: sendPluginScanResults,
+      getAuthMode: getActiveAuthMode,
       sendStatusMessage,
       getReplacementText: () => latestReplacementText,
     });

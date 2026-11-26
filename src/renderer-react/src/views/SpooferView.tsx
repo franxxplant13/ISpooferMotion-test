@@ -7,6 +7,8 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
   const [robloxCookie, setRobloxCookie] = useState('');
   const [openCloudApiKey, setOpenCloudApiKey] = useState('');
   const [groupId, setGroupId] = useState('');
+  const [authMode, setAuthMode] = useState('apiKey');
+  const [userId, setUserId] = useState('');
 
   const [autoDetectCookie, setAutoDetectCookie] = useState(true);
   const [downloadOnly, setDownloadOnly] = useState(false);
@@ -55,6 +57,12 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
   useEffect(() => {
     let active = true;
 
+    if (authMode === 'apiKey') {
+      setInlineQuotaText(hasAudio ? 'Roblox checks audio quota during upload.' : '');
+      setInlineQuotaError(false);
+      return;
+    }
+
     if (!hasAudio) {
       setInlineQuotaText('');
       setInlineQuotaError(false);
@@ -100,12 +108,14 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
       });
 
     return () => { active = false; };
-  }, [hasAudio, robloxCookie, autoDetectCookie]);
+  }, [hasAudio, robloxCookie, autoDetectCookie, authMode]);
 
   useEffect(() => {
     const handleProfileChanged = async () => {
       const profile = await getActiveProfileSettings();
       if (profile) {
+        setAuthMode(profile.authMode ?? 'cookie');
+        setUserId(profile.userId ?? '');
         setRobloxCookie(profile.cookie ?? '');
         setOpenCloudApiKey(profile.apiKey ?? '');
         setGroupId(profile.groupId ?? '');
@@ -171,11 +181,12 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
     setUploadComplete(false);
     if (!animationId.trim()) { setStatusText('Paste at least one asset entry first.'); return; }
     if (downloadOnly && !downloadFolder) { setStatusText('Choose a download folder for Download only mode.'); return; }
-    if (!downloadOnly && !openCloudApiKey) { setStatusText('Open Cloud API key is required for upload/spoofing.'); return; }
-    if (!autoDetectCookie && !robloxCookie) { setStatusText('Enter a Roblox cookie or enable Auto detect cookie.'); return; }
+    if ((!downloadOnly || authMode === 'apiKey') && !openCloudApiKey.trim()) { setStatusText('Open Cloud API key is required for upload/spoofing.'); return; }
+    if (authMode === 'apiKey' && !downloadOnly && !groupId && !/^[1-9]\d*$/.test(userId)) { setStatusText('Enter your upload User ID or Group ID.'); return; }
+    if (authMode === 'cookie' && !autoDetectCookie && !robloxCookie) { setStatusText('Enter a Roblox cookie or enable Auto detect cookie.'); return; }
 
     const normalizedApiKey = openCloudApiKey.trim();
-    if (!downloadOnly) {
+    if (!downloadOnly || authMode === 'apiKey') {
       setOpenCloudApiKey(normalizedApiKey);
       await updateProfileValue('apiKey', normalizedApiKey);
     }
@@ -184,8 +195,8 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
     const profile = (await getActiveProfileSettings()) || {};
 
     const payload = {
-      animationId, robloxCookie, apiKey: normalizedApiKey, groupId,
-      enableSpoofing: !downloadOnly, downloadOnly, autoDetectCookie, downloadFolder,
+      animationId, robloxCookie: authMode === 'cookie' ? robloxCookie : '', apiKey: normalizedApiKey, groupId, authMode, userId,
+      enableSpoofing: !downloadOnly, downloadOnly, autoDetectCookie: authMode === 'cookie' && autoDetectCookie, downloadFolder,
       maxPlaceIds, maxPlaceIdRetries, overridePlaceId, uploadRetries, uploadRetryDelay,
       batchRetries: profile.defRetries ?? 3, batchRetryDelay: profile.defDelay ?? 5000,
       batchTimeoutMs: 15000, batchChunkSize: 50,
@@ -197,7 +208,6 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
       renameReplace: profile.renameToggle ? (profile.renameReplace ?? '') : '',
       maxConcurrentDownloads: profile.maxConcurrentDownloads ?? 20,
       desktopNotifications: profile.notifications ?? true,
-      shareCacheData: profile.shareCacheData ?? true,
     };
     (window as any).electronAPI?.runSpooferAction?.(payload);
   };
@@ -334,19 +344,40 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
         
         <VStack spacing="16px" align="stretch">
           <Box>
+            <Text fontSize="12px" color="discord.muted" mb="8px">Authentication</Text>
+            <Select aria-label="Authentication mode" value={authMode} isDisabled={running} onChange={async (e) => {
+              const mode = e.target.value;
+              setAuthMode(mode);
+              await updateProfileValue('authMode', mode);
+              window.dispatchEvent(new Event('profile-changed'));
+            }}>
+              <option value="apiKey">API key only</option>
+              <option value="cookie">Cookie + API key</option>
+            </Select>
+            {authMode === 'apiKey' && <Text fontSize="12px" color="discord.muted" mt="8px">Requires Asset Delivery access and Assets Read/Write for uploads. Restricted assets may require Cookie mode.</Text>}
+          </Box>
+          {authMode === 'cookie' && <Box>
             <HStack mb="8px"><Key size={14} color="#949ba4" /><Text fontSize="12px" color="discord.muted" fontWeight={600}>Roblox Cookie {autoDetectCookie ? '(Auto)' : ''}</Text></HStack>
             <Input size="sm" type="password" disabled={autoDetectCookie} value={robloxCookie} onChange={(e) => { setRobloxCookie(e.target.value); updateProfileValue('cookie', e.target.value); }} bg="discord.input" border="none" color="discord.text" borderRadius="4px" h="36px" _focus={{ boxShadow: 'none', border: '1px solid', borderColor: 'brand.500' }} />
-          </Box>
+          </Box>}
           <Box>
             <HStack mb="8px"><Key size={14} color="#949ba4" /><Text fontSize="12px" color="discord.muted" fontWeight={600}>Open Cloud API Key</Text></HStack>
             <InputGroup size="sm">
-              <Input type="password" disabled={downloadOnly} value={openCloudApiKey} onChange={(e) => { setOpenCloudApiKey(e.target.value); setApiKeyStatus('Unsaved changes...'); }} onBlur={async () => { const t = openCloudApiKey.trim(); setOpenCloudApiKey(t); await updateProfileValue('apiKey', t); setApiKeyStatus('Saved.'); }} bg="discord.input" border="none" color="discord.text" pr="80px" borderRadius="4px" h="36px" _focus={{ boxShadow: 'none', border: '1px solid', borderColor: 'discord.muted' }} />
+              <Input type="password" disabled={downloadOnly && authMode === 'cookie'} value={openCloudApiKey} onChange={(e) => { setOpenCloudApiKey(e.target.value); setApiKeyStatus('Unsaved changes...'); }} onBlur={async () => { const t = openCloudApiKey.trim(); setOpenCloudApiKey(t); await updateProfileValue('apiKey', t); setApiKeyStatus('Saved.'); }} bg="discord.input" border="none" color="discord.text" pr="80px" borderRadius="4px" h="36px" _focus={{ boxShadow: 'none', border: '1px solid', borderColor: 'discord.muted' }} />
               <InputRightElement w="80px" h="36px">
                 <Button size="xs" variant="ghost" h="24px" mt="6px" color="discord.muted" _hover={{ bg: 'discord.background', color: 'discord.text' }} onClick={() => (window as any).electronAPI?.openExternal?.('https://create.roblox.com/dashboard/credentials')}>Get Key</Button>
               </InputRightElement>
             </InputGroup>
             {apiKeyStatus && <Text fontSize="11px" color="discord.darkMuted" mt="4px" fontWeight={500}>{apiKeyStatus}</Text>}
           </Box>
+          {authMode === 'apiKey' && !downloadOnly && !groupId && <Box>
+            <Text fontSize="12px" color="discord.muted" mb="8px">Upload User ID</Text>
+            <Input aria-label="Upload User ID" value={userId} placeholder="Your Roblox user ID" onChange={(e) => {
+              const id = e.target.value.replace(/\D/g, '');
+              setUserId(id);
+              updateProfileValue('userId', id);
+            }} />
+          </Box>}
           <Box>
             <HStack mb="8px"><Hash size={14} color="#949ba4" /><Text fontSize="12px" color="discord.muted" fontWeight={600}>Group ID (Blank for user)</Text></HStack>
             <Input size="sm" disabled={downloadOnly} value={groupId} onChange={(e) => { const n = e.target.value.replace(/\D/g, ''); setGroupId(n); updateProfileValue('groupId', n); }} bg="discord.input" border="none" color="discord.text" borderRadius="4px" h="36px" _focus={{ boxShadow: 'none', border: '1px solid', borderColor: 'brand.500' }} />
@@ -365,7 +396,7 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
           </Collapse>
 
           <VStack spacing="12px" align="stretch" mt="8px">
-            <HStack justify="space-between"><Text fontSize="13px" color="discord.text" fontWeight={500}>Auto detect cookie</Text><Switch colorScheme="brand" size="sm" isChecked={autoDetectCookie} onChange={(e) => { setAutoDetectCookie(e.target.checked); updateProfileValue('autoDetectCookie', e.target.checked); }} /></HStack>
+            {authMode === 'cookie' && <HStack justify="space-between"><Text fontSize="13px" color="discord.text" fontWeight={500}>Auto detect cookie</Text><Switch colorScheme="brand" size="sm" isChecked={autoDetectCookie} onChange={(e) => { setAutoDetectCookie(e.target.checked); updateProfileValue('autoDetectCookie', e.target.checked); }} /></HStack>}
             <HStack justify="space-between"><Text fontSize="13px" color="discord.text" fontWeight={500}>Download only</Text><Switch colorScheme="brand" size="sm" isChecked={downloadOnly} onChange={(e) => { setDownloadOnly(e.target.checked); updateProfileValue('downloadOnly', e.target.checked); }} /></HStack>
           </VStack>
         </VStack>
@@ -373,6 +404,7 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
         <Box h="1px" bg="discord.border" my="16px" />
         
         <VStack spacing="16px" align="stretch">
+          {authMode === 'cookie' && <>
           <Box>
             <Text fontSize="12px" color="discord.muted" mb="8px" fontWeight={600}>Search Place (URL or ID)</Text>
             <HStack>
@@ -397,6 +429,7 @@ export default function SpooferView({ isActive }: { isActive: boolean }) {
             <Text fontSize="12px" color="discord.muted" mb="8px" fontWeight={600}>Override Place ID</Text>
             <Input size="sm" placeholder="Leave blank to use Group/User default" value={overridePlaceId} onChange={(e) => { const n = e.target.value.replace(/\D/g, ''); setOverridePlaceId(n); updateProfileValue('overridePlaceId', n); }} bg="discord.input" border="none" color="discord.text" borderRadius="4px" h="36px" _focus={{ boxShadow: 'none', border: '1px solid', borderColor: 'brand.500' }} />
           </Box>
+          </>}
         </VStack>
       </VStack>
     </Flex>
