@@ -26,6 +26,7 @@ const {
 const { loadJobs, saveJobRecord, deleteJobRecord } = require('./jobs');
 const { saveSession, loadSession, clearSession } = require('./session');
 const { createRobloxSession } = require('./roblox-session');
+const { createOpenCloudSession } = require('./open-cloud-session');
 const {
   loadPlaceIdCache,
   savePlaceIdCache,
@@ -530,6 +531,7 @@ function migrateProfileSecrets(allSecrets) {
           : {
               default: {
                 name: 'Default Profile',
+                authMode: 'apiKey',
                 cookie: '',
                 apiKey: '',
                 groupId: '',
@@ -544,6 +546,7 @@ function migrateProfileSecrets(allSecrets) {
       profiles: {
         default: {
           name: 'Default Profile',
+          authMode: 'apiKey',
           cookie: '',
           apiKey: '',
           groupId: '',
@@ -562,6 +565,7 @@ async function loadProfileSecrets() {
   if (Object.keys(migrated.profiles).length === 0) {
     migrated.profiles.default = {
       name: 'Default Profile',
+      authMode: 'apiKey',
       cookie: '',
       apiKey: '',
       groupId: '',
@@ -654,6 +658,9 @@ async function fetchJson(url, options = {}) {
 
 async function getRobloxProfile(context) {
   if (!context) return null;
+  const secrets = await loadProfileSecrets();
+  const profile = secrets.profiles[context.profileId || secrets.activeProfileId];
+  if (profile?.authMode === 'apiKey') return null;
   let cookie = context.cookie;
   if (!cookie && context.autoDetect) {
     cookie = await getCookieFromAutoDetect();
@@ -739,7 +746,11 @@ function parsePlaceLookupInput(input, explicitType) {
 async function detectOpenCloudApiKeyOwner(apiKey) {
   const key = String(apiKey || '').trim();
   if (!key) {
-    return { ok: false, ownerUserId: null, message: 'API key is required to detect owner.' };
+    return {
+      ok: false,
+      ownerUserId: null,
+      message: 'API key is required to detect owner.',
+    };
   }
 
   try {
@@ -1003,7 +1014,9 @@ function parseSpooferAssetLine(trimmedLine) {
         return { error: 'Type must be Sound, Audio, or Animation.' };
       }
     } else {
-      return { error: 'Extra fields must be Type:Sound, Type:Animation, or Place:123.' };
+      return {
+        error: 'Extra fields must be Type:Sound, Type:Animation, or Place:123.',
+      };
     }
   }
 
@@ -1228,10 +1241,11 @@ function registerIpcHandlers(
     try {
       const safeText = String(text || '').trim();
       if (!safeText) return { ok: false, error: 'No output text provided.' };
-      
+
       const count = pushReplacement(safeText);
-      if (!count || count === 0) return { ok: false, error: 'No replacement pairs found in output.' };
-      
+      if (!count || count === 0)
+        return { ok: false, error: 'No replacement pairs found in output.' };
+
       return { ok: true, count };
     } catch (err) {
       return { ok: false, error: err.message || 'Unknown error' };
@@ -1276,11 +1290,10 @@ function registerIpcHandlers(
           { detached: true, stdio: 'ignore' },
         );
       } else {
-        child = spawn(
-          'x-terminal-emulator',
-          ['-e', 'tail', '-f', latestLog],
-          { detached: true, stdio: 'ignore' },
-        );
+        child = spawn('x-terminal-emulator', ['-e', 'tail', '-f', latestLog], {
+          detached: true,
+          stdio: 'ignore',
+        });
       }
       child.unref();
       return true;
@@ -1489,12 +1502,14 @@ async function handleSpooferAction(
   sendSpooferProgress,
 ) {
   data = normalizePayload(data);
+  const useApiKey = data.authMode === 'apiKey';
 
   resetRunControls();
 
   if (DEVELOPER_MODE) {
     const sanitizedData = { ...data };
     if (sanitizedData.robloxCookie) sanitizedData.robloxCookie = '{Cookie:Here}';
+    if (sanitizedData.apiKey) sanitizedData.apiKey = '{ApiKey:Here}';
     console.log('MAIN_PROCESS (Dev): Received run-spoofer-action with data:', sanitizedData);
   } else {
     console.log('MAIN_PROCESS: Received run-spoofer-action.');
@@ -1540,7 +1555,22 @@ async function handleSpooferAction(
   }
 
   data.apiKey = String(data.apiKey || '').trim();
+  data.userId = String(data.userId || '').trim();
   data.groupId = data.groupId ? String(data.groupId).replace(/\D/g, '') : '';
+  if (useApiKey && !data.apiKey) {
+    sendSpooferResultToRenderer({
+      output: 'API-key mode requires an Open Cloud API key.',
+      success: false,
+    });
+    return;
+  }
+  if (useApiKey && !data.downloadOnly && !data.groupId && !/^[1-9]\d*$/.test(data.userId)) {
+    sendSpooferResultToRenderer({
+      output: 'Enter your numeric upload User ID or a Group ID for API-key mode.',
+      success: false,
+    });
+    return;
+  }
   data.overridePlaceId = data.overridePlaceId
     ? String(data.overridePlaceId).replace(/\D/g, '')
     : '';
@@ -1623,54 +1653,61 @@ async function handleSpooferAction(
 
   if (invalidAssetLines.length || duplicateAssetLines.length) {
     const msg = `Smart Dedup: ${assetEntries.length} valid entries. Skipped ${duplicateAssetLines.length} duplicates and ${invalidAssetLines.length} invalid lines.`;
-    console.warn(`[INPUT] Processing ${assetEntries.length} valid entries; skipped ${invalidAssetLines.length} invalid and ${duplicateAssetLines.length} duplicate line(s).`);
+    console.warn(
+      `[INPUT] Processing ${assetEntries.length} valid entries; skipped ${invalidAssetLines.length} invalid and ${duplicateAssetLines.length} duplicate line(s).`,
+    );
     sendStatusMessage(msg);
   }
 
   const animationEntries = assetEntries;
 
   const firstEntry = animationEntries[0];
-  let robloxCookie = data.robloxCookie;
-  if (data.autoDetectCookie) {
-    try {
-      if (firstEntry.creatorType === 'user') {
-        robloxCookie = await getCookieFromAutoDetect(firstEntry.creatorId);
-      } else {
-        robloxCookie = await getCookieFromAutoDetect();
+  let robloxCookie = useApiKey ? '' : data.robloxCookie;
+  let robloxSession;
+  let preflightAuthUserId;
+  if (useApiKey) {
+    robloxSession = createOpenCloudSession(data.apiKey);
+  } else {
+    if (data.autoDetectCookie) {
+      try {
+        if (firstEntry.creatorType === 'user') {
+          robloxCookie = await getCookieFromAutoDetect(firstEntry.creatorId);
+        } else {
+          robloxCookie = await getCookieFromAutoDetect();
+        }
+        if (!robloxCookie) throw new Error('Auto-detected cookie empty/not found.');
+      } catch (err) {
+        if (DEVELOPER_MODE) console.warn('(Dev) Error auto-detecting cookie:', err);
+        sendSpooferResultToRenderer({
+          output: `Failed to auto-detect cookie: ${err.message}`,
+          success: false,
+        });
+        return;
       }
-      if (!robloxCookie) throw new Error('Auto-detected cookie empty/not found.');
-    } catch (err) {
-      if (DEVELOPER_MODE) console.warn('(Dev) Error auto-detecting cookie:', err);
+    }
+    if (!robloxCookie) {
       sendSpooferResultToRenderer({
-        output: `Failed to auto-detect cookie: ${err.message}`,
+        output: 'Roblox cookie not provided.',
         success: false,
       });
       return;
     }
-  }
-  if (!robloxCookie) {
-    sendSpooferResultToRenderer({
-      output: 'Roblox cookie not provided.',
-      success: false,
-    });
-    return;
-  }
 
-  const robloxSession = createRobloxSession(robloxCookie);
+    robloxSession = createRobloxSession(robloxCookie);
 
-  let preflightAuthUserId;
-  sendStatusMessage('Validating Roblox session...');
-  try {
-    preflightAuthUserId = await getAuthenticatedUserId(robloxCookie);
-    if (DEVELOPER_MODE)
-      console.log(`(Dev) Cookie pre-flight OK — authenticated as user ${preflightAuthUserId}`);
-  } catch (preflightErr) {
-    sendSpooferResultToRenderer({
-      output: `Cookie validation failed: ${preflightErr.message}\n\nMake sure your ROBLOSECURITY cookie is current and not expired. You can re-copy it from your browser.`,
-      success: false,
-    });
-    sendStatusMessage('Cookie validation failed');
-    return;
+    sendStatusMessage('Validating Roblox session...');
+    try {
+      preflightAuthUserId = await getAuthenticatedUserId(robloxCookie);
+      if (DEVELOPER_MODE)
+        console.log(`(Dev) Cookie pre-flight OK — authenticated as user ${preflightAuthUserId}`);
+    } catch (preflightErr) {
+      sendSpooferResultToRenderer({
+        output: `Cookie validation failed: ${preflightErr.message}\n\nMake sure your ROBLOSECURITY cookie is current and not expired. You can re-copy it from your browser.`,
+        success: false,
+      });
+      sendStatusMessage('Cookie validation failed');
+      return;
+    }
   }
 
   try {
@@ -1792,7 +1829,9 @@ async function handleSpooferAction(
 
   const maxPlaceIds = data.maxPlaceIds || 200;
   const maxPlaceIdRetries = data.maxPlaceIdRetries || 3;
-  const _parsedOverridePlaceId = data.overridePlaceId ? Number.parseInt(data.overridePlaceId, 10) : NaN;
+  const _parsedOverridePlaceId = data.overridePlaceId
+    ? Number.parseInt(data.overridePlaceId, 10)
+    : NaN;
   const overridePlaceId = Number.isFinite(_parsedOverridePlaceId) ? _parsedOverridePlaceId : null;
   const uniqueCreators = [
     ...new Set(animationEntries.map((e) => `${e.creatorType}:${e.creatorId}`)),
@@ -1819,352 +1858,379 @@ async function handleSpooferAction(
   }
 
   const placeIdMap = {};
-  if (animationEntries.length > 0) {
-    sendStatusMessage('Discovering compatible Roblox places...');
-    if (DEVELOPER_MODE)
-      console.log(
-        `(Dev) Found ${animationEntries.length > 0 ? [...new Set(animationEntries.map((e) => `${e.creatorType}:${e.creatorId}`))].length : 0} unique creators. Fetching placeIds (max ${maxPlaceIds} per creator, ${maxPlaceIdRetries} retries)...`,
-      );
-
-    if (DEVELOPER_MODE)
-      console.log(`(Dev) Fetching placeIds for ${uniqueCreators.length} creator(s) in parallel...`);
-
-    await runWithConcurrency(uniqueCreators, 5, async (creatorKey) => {
-      const [creatorType, creatorId] = creatorKey.split(':');
-      // Prepend cached (proven) placeIds so they are tried before fresh discovery.
-      const cachedIds = getCachedPlaceIds(placeIdCacheEntries, creatorKey);
-      if (cachedIds.length > 0 && DEVELOPER_MODE)
-        console.log(`(Dev) Cache hit for ${creatorKey}: ${cachedIds.length} cached placeId(s)`);
-      try {
-        const placeIds = await retryAsync(
-          () => getPlaceIdFromCreator(creatorType, creatorId, robloxCookie, maxPlaceIds),
-          maxPlaceIdRetries,
-          1000,
-          (attempt, max, err) => {
-            if (DEVELOPER_MODE)
-              console.warn(`(Dev) Attempt ${attempt}/${max} for ${creatorKey}: ${err.message}`);
-          },
-        );
-        placeIdMap[creatorKey] = uniquePlaceIds(
-          entryPlaceIdsByCreator[creatorKey],
-          cachedIds,
-          placeIds,
-        );
-        if (DEVELOPER_MODE)
-          console.log(
-            `(Dev) Got ${placeIdMap[creatorKey].length} placeIds for ${creatorKey} (${cachedIds.length} cached)`,
-          );
-      } catch (error) {
-        if (DEVELOPER_MODE)
-          console.warn(`(Dev) Could not get placeIds for ${creatorKey}: ${error.message}`);
-        placeIdMap[creatorKey] = uniquePlaceIds(entryPlaceIdsByCreator[creatorKey], cachedIds);
-      }
-    });
-
-    const creatorsNeedingFallback = uniqueCreators.filter(
-      (k) => !placeIdMap[k] || placeIdMap[k].length === 0,
-    );
-    if (creatorsNeedingFallback.length > 0) {
-      sendStatusMessage('Searching for alternate place context for private assets...');
+  const locationsMap = {};
+  if (!useApiKey) {
+    if (animationEntries.length > 0) {
+      sendStatusMessage('Discovering compatible Roblox places...');
       if (DEVELOPER_MODE)
         console.log(
-          `(Dev) ${creatorsNeedingFallback.length} creator(s) have no places. Building fallback pools...`,
+          `(Dev) Found ${animationEntries.length > 0 ? [...new Set(animationEntries.map((e) => `${e.creatorType}:${e.creatorId}`))].length : 0} unique creators. Fetching placeIds (max ${maxPlaceIds} per creator, ${maxPlaceIdRetries} retries)...`,
         );
 
-      const fallbackAuthUserId = preflightAuthUserId;
-
-      const fallbackPools = new Map();
-      const getFallbackPool = async (creatorKey, creatorType, creatorId) => {
-        if (fallbackPools.has(creatorKey)) return fallbackPools.get(creatorKey);
-        const pool = await getPlaceIdsFromAllUserContext(
-          fallbackAuthUserId,
-          creatorId,
-          creatorType,
-          robloxCookie,
-          10,
+      if (DEVELOPER_MODE)
+        console.log(
+          `(Dev) Fetching placeIds for ${uniqueCreators.length} creator(s) in parallel...`,
         );
-        fallbackPools.set(creatorKey, pool);
-        if (DEVELOPER_MODE)
-          console.log(`(Dev) Fallback pool for ${creatorKey} has ${pool.length} place IDs`);
-        return pool;
-      };
 
-      for (const creatorKey of creatorsNeedingFallback) {
+      await runWithConcurrency(uniqueCreators, 5, async (creatorKey) => {
         const [creatorType, creatorId] = creatorKey.split(':');
-        const fallbackPool = await getFallbackPool(creatorKey, creatorType, creatorId);
-        if (fallbackPool.length > 0) {
-          placeIdMap[creatorKey] = uniquePlaceIds(entryPlaceIdsByCreator[creatorKey], fallbackPool);
+        // Prepend cached (proven) placeIds so they are tried before fresh discovery.
+        const cachedIds = getCachedPlaceIds(placeIdCacheEntries, creatorKey);
+        if (cachedIds.length > 0 && DEVELOPER_MODE)
+          console.log(`(Dev) Cache hit for ${creatorKey}: ${cachedIds.length} cached placeId(s)`);
+        try {
+          const placeIds = await retryAsync(
+            () => getPlaceIdFromCreator(creatorType, creatorId, robloxCookie, maxPlaceIds),
+            maxPlaceIdRetries,
+            1000,
+            (attempt, max, err) => {
+              if (DEVELOPER_MODE)
+                console.warn(`(Dev) Attempt ${attempt}/${max} for ${creatorKey}: ${err.message}`);
+            },
+          );
+          placeIdMap[creatorKey] = uniquePlaceIds(
+            entryPlaceIdsByCreator[creatorKey],
+            cachedIds,
+            placeIds,
+          );
           if (DEVELOPER_MODE)
             console.log(
-              `(Dev) Assigned ${placeIdMap[creatorKey].length} fallback place IDs to ${creatorKey}`,
+              `(Dev) Got ${placeIdMap[creatorKey].length} placeIds for ${creatorKey} (${cachedIds.length} cached)`,
             );
+        } catch (error) {
+          if (DEVELOPER_MODE)
+            console.warn(`(Dev) Could not get placeIds for ${creatorKey}: ${error.message}`);
+          placeIdMap[creatorKey] = uniquePlaceIds(entryPlaceIdsByCreator[creatorKey], cachedIds);
         }
-      }
-    }
-
-    if (overridePlaceId) {
-      for (const creatorKey of uniqueCreators) {
-        placeIdMap[creatorKey] = uniquePlaceIds(overridePlaceId, placeIdMap[creatorKey]);
-      }
-      if (DEVELOPER_MODE) console.log('(Dev) Prepended overridePlaceId to all creator placeIdMaps');
-    }
-
-    if (DEVELOPER_MODE) console.log('(Dev) Resolved placeIdMap:', placeIdMap);
-
-    const creatorsWithNoPlaces = uniqueCreators.filter((k) => !placeIdMap[k]?.length);
-    if (creatorsWithNoPlaces.length > 0) {
-      const affectedCount = animationEntries.filter((e) =>
-        creatorsWithNoPlaces.includes(`${e.creatorType}:${e.creatorId}`),
-      ).length;
-      const warnMsg =
-        `⚠️ No Roblox place context found for ${creatorsWithNoPlaces.length} creator(s) ` +
-        `(affects ${affectedCount} asset${affectedCount !== 1 ? 's' : ''}). ` +
-        `Private assets from these creators may fail with 403. ` +
-        `Consider adding an Override Place ID or re-importing from the Studio plugin scan.`;
-      console.warn(`[PLACE CONTEXT] ${warnMsg}`);
-      sendStatusMessage(warnMsg);
-      sendSpooferLog?.(warnMsg);
-    }
-  }
-
-  const locationsMap = {};
-  const batchItems = animationEntries.map((entry) => ({
-    requestId: entry.id,
-    assetId: parseInt(entry.id),
-    creatorType: entry.creatorType,
-    creatorId: entry.creatorId,
-  }));
-
-  const BATCH_MAX_RETRIES = parseInt(data.batchRetries, 10) || 5;
-  const BATCH_RETRY_DELAY_MS = parseInt(data.batchRetryDelay, 10) || 2000;
-  const BATCH_TIMEOUT_MS = parseInt(data.batchTimeoutMs, 10) || 15000;
-  const chunkSize = Math.min(50, Math.max(1, parseInt(data.batchChunkSize, 10) || 10));
-
-  sendStatusMessage('Resolving download locations...');
-  sendSpooferProgress({
-    phase: 'locations',
-    current: 0,
-    total: batchItems.length,
-  });
-  if (DEVELOPER_MODE)
-    console.log(
-      `(Dev) Fetching batch locations for ${batchItems.length} assets with creator-specific placeIds`,
-    );
-  const batchTasks = [];
-  const creatorGroups = {};
-  for (const item of batchItems) {
-    const creatorKey = `${item.creatorType}:${item.creatorId}`;
-    if (!creatorGroups[creatorKey]) creatorGroups[creatorKey] = [];
-    creatorGroups[creatorKey].push(item);
-  }
-  for (const [creatorKey, items] of Object.entries(creatorGroups)) {
-    for (let i = 0; i < items.length; i += chunkSize) {
-      batchTasks.push({
-        creatorKey,
-        items: items.slice(i, i + chunkSize),
       });
-    }
-  }
 
-  let resolvedLocationsCount = 0;
-  await runWithConcurrency(batchTasks, 5, async (task) => {
-    checkCancelled();
-    await checkPaused();
-
-    const { creatorKey, items } = task;
-    const [creatorType, creatorId] = creatorKey.split(':');
-    let placeIdArray = placeIdMap[creatorKey] || [];
-    let placeIdIndex = 0;
-    let retryCount = 0;
-    const maxRetries = maxPlaceIdRetries;
-
-    try {
-      for (const item of items) {
-        setBatchLocation(locationsMap, {
-          requestId: item.requestId,
-          errors: [
-            {
-              message:
-                placeIdArray.length === 0
-                  ? 'No places found for creator to authorize download'
-                  : 'Asset missing from batch response',
-            },
-          ],
-        });
-      }
-
-      while (placeIdIndex < placeIdArray.length) {
-        checkCancelled();
-        await checkPaused();
-        const placeId = placeIdArray[placeIdIndex];
-        const itemsWithoutCreator = items.map(
-          ({ creatorType: _creatorType, creatorId: _creatorId, ...rest }) => ({
-            ...rest,
-            placeId: placeId,
-            serverPlaceId: placeId,
-          }),
-        );
-
+      const creatorsNeedingFallback = uniqueCreators.filter(
+        (k) => !placeIdMap[k] || placeIdMap[k].length === 0,
+      );
+      if (creatorsNeedingFallback.length > 0) {
+        sendStatusMessage('Searching for alternate place context for private assets...');
         if (DEVELOPER_MODE)
           console.log(
-            `(Dev) Batch request for ${creatorKey}: ${items.length} items with placeId ${placeId}${placeIdIndex > 0 ? ` (place index ${placeIdIndex}/${placeIdArray.length})` : ''}`,
+            `(Dev) ${creatorsNeedingFallback.length} creator(s) have no places. Building fallback pools...`,
           );
 
-        let locations;
-        for (let attempt = 1; attempt <= BATCH_MAX_RETRIES; attempt++) {
-          if (attempt > 1) {
-            sendStatusMessage(
-              `Resolving download locations... retry ${attempt}/${BATCH_MAX_RETRIES}`,
+        const fallbackAuthUserId = preflightAuthUserId;
+
+        const fallbackPools = new Map();
+        const getFallbackPool = async (creatorKey, creatorType, creatorId) => {
+          if (fallbackPools.has(creatorKey)) return fallbackPools.get(creatorKey);
+          const pool = await getPlaceIdsFromAllUserContext(
+            fallbackAuthUserId,
+            creatorId,
+            creatorType,
+            robloxCookie,
+            10,
+          );
+          fallbackPools.set(creatorKey, pool);
+          if (DEVELOPER_MODE)
+            console.log(`(Dev) Fallback pool for ${creatorKey} has ${pool.length} place IDs`);
+          return pool;
+        };
+
+        for (const creatorKey of creatorsNeedingFallback) {
+          const [creatorType, creatorId] = creatorKey.split(':');
+          const fallbackPool = await getFallbackPool(creatorKey, creatorType, creatorId);
+          if (fallbackPool.length > 0) {
+            placeIdMap[creatorKey] = uniquePlaceIds(
+              entryPlaceIdsByCreator[creatorKey],
+              fallbackPool,
             );
-          }
-          await waitBatchRequestSlot();
-
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), BATCH_TIMEOUT_MS);
-          let resp;
-          let caughtErr = null;
-          try {
-            resp = await robloxSession.fetch('https://assetdelivery.roblox.com/v2/assets/batch', {
-              method: 'POST',
-              headers: {
-                'User-Agent': 'RobloxStudio/WinInet',
-                'Content-Type': 'application/json',
-                'Roblox-Place-Id': String(placeId),
-                'Roblox-Browser-Asset-Request': 'false',
-              },
-              body: JSON.stringify(itemsWithoutCreator),
-              signal: controller.signal,
-            });
-          } catch (err) {
-            caughtErr = err;
-          } finally {
-            clearTimeout(timeout);
-          }
-          if (resp) updateBatchRateLimitFromHeaders(resp);
-
-          if (resp && resp.ok) {
-            locations = await resp.json();
-            break;
-          }
-
-          const status = resp ? resp.status : 0;
-          const isTimeout =
-            caughtErr &&
-            (caughtErr.name === 'AbortError' || /aborted|timeout/i.test(caughtErr.message));
-          const retryable =
-            isTimeout ||
-            status === 429 ||
-            status === 502 ||
-            status === 503 ||
-            status === 504 ||
-            status === 500;
-          const statusText = resp
-            ? `${status}`
-            : isTimeout
-              ? 'timeout'
-              : caughtErr
-                ? caughtErr.message
-                : 'unknown';
-
-          if (DEVELOPER_MODE) {
-            console.warn(
-              `(Dev) Batch attempt ${attempt}/${BATCH_MAX_RETRIES} for ${creatorKey} @ place ${placeId} failed: ${statusText}${retryable && attempt < BATCH_MAX_RETRIES ? ' -> retrying' : ''}`,
-            );
-            console.warn(
-              `(Dev) [Diagnostics] Creator Key: ${creatorKey}, Items: ${items.length}, Place ID: ${placeId}, Attempt: ${attempt}`,
-            );
-            if (resp) {
-              console.warn(
-                `(Dev) [Diagnostics] Retry-After: ${resp.headers.get('retry-after') || 'none'}`,
-              );
-            }
-          }
-
-          if (!retryable || attempt === BATCH_MAX_RETRIES) {
-            if (DEVELOPER_MODE && resp) {
-              try {
-                const clonedResp = resp.clone();
-                const text = await clonedResp.text();
-                console.warn(`(Dev) [Diagnostics] Response Body: ${text.substring(0, 500)}`);
-              } catch {}
-            }
-            throw new Error(`Batch request failed for ${creatorKey}: ${statusText}`);
-          }
-
-          if (status === 429 && resp) {
-            const delayMs = getBatchRetryAfterMs(resp, attempt);
-            sendStatusMessage(
-              `Roblox rate limited download lookup. Retrying in ${Math.ceil(delayMs / 1000)}s...`,
-            );
-            if (DEVELOPER_MODE)
-              console.warn(`(Dev) Rate limited (429). Pausing batch globally for ${delayMs}ms`);
-            setBatchRateLimit(delayMs);
-          } else {
-            const delayMs = BATCH_RETRY_DELAY_MS + Math.floor(Math.random() * 300);
-            await new Promise((r) => setTimeout(r, delayMs));
-          }
-        }
-
-        if (!locations) throw new Error(`Batch request failed for ${creatorKey}: no response`);
-        if (DEVELOPER_MODE) console.log(`(Dev) Batch response for ${creatorKey}:`, locations);
-
-        const hasBatchErrors = locations.some(hasBatchAccessDeniedErrors);
-
-        const errorItems = locations.filter((loc) => loc.errors && loc.errors.length > 0);
-        if (errorItems.length > 0 && DEVELOPER_MODE) {
-          for (const locErr of errorItems) {
-            const firstErr = locErr.errors[0] || {};
-            console.warn(
-              `Batch error for ${locErr.requestId} at place ${placeId}:`,
-              JSON.stringify(firstErr),
-            );
-            console.log(
-              '(Dev) Full batch item with error:',
-              JSON.stringify(locErr, null, 2).substring(0, 500),
-            );
-          }
-        }
-
-        if (hasBatchErrors) {
-          for (const loc of locations) {
-            if (hasBatchLocationSuccess(loc)) setBatchLocation(locationsMap, loc);
-          }
-
-          if (placeIdIndex < placeIdArray.length - 1) {
             if (DEVELOPER_MODE)
               console.log(
-                `(Dev) Batch errors detected for ${creatorKey} with placeId ${placeId}. Trying next place...`,
+                `(Dev) Assigned ${placeIdMap[creatorKey].length} fallback place IDs to ${creatorKey}`,
               );
-            placeIdIndex++;
-            continue;
-          } else {
-            if (retryCount < maxRetries) {
-              retryCount++;
+          }
+        }
+      }
+
+      if (overridePlaceId) {
+        for (const creatorKey of uniqueCreators) {
+          placeIdMap[creatorKey] = uniquePlaceIds(overridePlaceId, placeIdMap[creatorKey]);
+        }
+        if (DEVELOPER_MODE)
+          console.log('(Dev) Prepended overridePlaceId to all creator placeIdMaps');
+      }
+
+      if (DEVELOPER_MODE) console.log('(Dev) Resolved placeIdMap:', placeIdMap);
+
+      const creatorsWithNoPlaces = uniqueCreators.filter((k) => !placeIdMap[k]?.length);
+      if (creatorsWithNoPlaces.length > 0) {
+        const affectedCount = animationEntries.filter((e) =>
+          creatorsWithNoPlaces.includes(`${e.creatorType}:${e.creatorId}`),
+        ).length;
+        const warnMsg =
+          `⚠️ No Roblox place context found for ${creatorsWithNoPlaces.length} creator(s) ` +
+          `(affects ${affectedCount} asset${affectedCount !== 1 ? 's' : ''}). ` +
+          `Private assets from these creators may fail with 403. ` +
+          `Consider adding an Override Place ID or re-importing from the Studio plugin scan.`;
+        console.warn(`[PLACE CONTEXT] ${warnMsg}`);
+        sendStatusMessage(warnMsg);
+        sendSpooferLog?.(warnMsg);
+      }
+    }
+
+    const batchItems = animationEntries.map((entry) => ({
+      requestId: entry.id,
+      assetId: parseInt(entry.id),
+      creatorType: entry.creatorType,
+      creatorId: entry.creatorId,
+    }));
+
+    const BATCH_MAX_RETRIES = parseInt(data.batchRetries, 10) || 5;
+    const BATCH_RETRY_DELAY_MS = parseInt(data.batchRetryDelay, 10) || 2000;
+    const BATCH_TIMEOUT_MS = parseInt(data.batchTimeoutMs, 10) || 15000;
+    const chunkSize = Math.min(50, Math.max(1, parseInt(data.batchChunkSize, 10) || 10));
+
+    sendStatusMessage('Resolving download locations...');
+    sendSpooferProgress({
+      phase: 'locations',
+      current: 0,
+      total: batchItems.length,
+    });
+    if (DEVELOPER_MODE)
+      console.log(
+        `(Dev) Fetching batch locations for ${batchItems.length} assets with creator-specific placeIds`,
+      );
+    const batchTasks = [];
+    const creatorGroups = {};
+    for (const item of batchItems) {
+      const creatorKey = `${item.creatorType}:${item.creatorId}`;
+      if (!creatorGroups[creatorKey]) creatorGroups[creatorKey] = [];
+      creatorGroups[creatorKey].push(item);
+    }
+    for (const [creatorKey, items] of Object.entries(creatorGroups)) {
+      for (let i = 0; i < items.length; i += chunkSize) {
+        batchTasks.push({
+          creatorKey,
+          items: items.slice(i, i + chunkSize),
+        });
+      }
+    }
+
+    let resolvedLocationsCount = 0;
+    await runWithConcurrency(batchTasks, 5, async (task) => {
+      checkCancelled();
+      await checkPaused();
+
+      const { creatorKey, items } = task;
+      const [creatorType, creatorId] = creatorKey.split(':');
+      let placeIdArray = placeIdMap[creatorKey] || [];
+      let placeIdIndex = 0;
+      let retryCount = 0;
+      const maxRetries = maxPlaceIdRetries;
+
+      try {
+        for (const item of items) {
+          setBatchLocation(locationsMap, {
+            requestId: item.requestId,
+            errors: [
+              {
+                message:
+                  placeIdArray.length === 0
+                    ? 'No places found for creator to authorize download'
+                    : 'Asset missing from batch response',
+              },
+            ],
+          });
+        }
+
+        while (placeIdIndex < placeIdArray.length) {
+          checkCancelled();
+          await checkPaused();
+          const placeId = placeIdArray[placeIdIndex];
+          const itemsWithoutCreator = items.map(
+            ({ creatorType: _creatorType, creatorId: _creatorId, ...rest }) => ({
+              ...rest,
+              placeId: placeId,
+              serverPlaceId: placeId,
+            }),
+          );
+
+          if (DEVELOPER_MODE)
+            console.log(
+              `(Dev) Batch request for ${creatorKey}: ${items.length} items with placeId ${placeId}${placeIdIndex > 0 ? ` (place index ${placeIdIndex}/${placeIdArray.length})` : ''}`,
+            );
+
+          let locations;
+          for (let attempt = 1; attempt <= BATCH_MAX_RETRIES; attempt++) {
+            if (attempt > 1) {
+              sendStatusMessage(
+                `Resolving download locations... retry ${attempt}/${BATCH_MAX_RETRIES}`,
+              );
+            }
+            await waitBatchRequestSlot();
+
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), BATCH_TIMEOUT_MS);
+            let resp;
+            let caughtErr = null;
+            try {
+              resp = await robloxSession.fetch('https://assetdelivery.roblox.com/v2/assets/batch', {
+                method: 'POST',
+                headers: {
+                  'User-Agent': 'RobloxStudio/WinInet',
+                  'Content-Type': 'application/json',
+                  'Roblox-Place-Id': String(placeId),
+                  'Roblox-Browser-Asset-Request': 'false',
+                },
+                body: JSON.stringify(itemsWithoutCreator),
+                signal: controller.signal,
+              });
+            } catch (err) {
+              caughtErr = err;
+            } finally {
+              clearTimeout(timeout);
+            }
+            if (resp) updateBatchRateLimitFromHeaders(resp);
+
+            if (resp && resp.ok) {
+              locations = await resp.json();
+              break;
+            }
+
+            const status = resp ? resp.status : 0;
+            const isTimeout =
+              caughtErr &&
+              (caughtErr.name === 'AbortError' || /aborted|timeout/i.test(caughtErr.message));
+            const retryable =
+              isTimeout ||
+              status === 429 ||
+              status === 502 ||
+              status === 503 ||
+              status === 504 ||
+              status === 500;
+            const statusText = resp
+              ? `${status}`
+              : isTimeout
+                ? 'timeout'
+                : caughtErr
+                  ? caughtErr.message
+                  : 'unknown';
+
+            if (DEVELOPER_MODE) {
+              console.warn(
+                `(Dev) Batch attempt ${attempt}/${BATCH_MAX_RETRIES} for ${creatorKey} @ place ${placeId} failed: ${statusText}${retryable && attempt < BATCH_MAX_RETRIES ? ' -> retrying' : ''}`,
+              );
+              console.warn(
+                `(Dev) [Diagnostics] Creator Key: ${creatorKey}, Items: ${items.length}, Place ID: ${placeId}, Attempt: ${attempt}`,
+              );
+              if (resp) {
+                console.warn(
+                  `(Dev) [Diagnostics] Retry-After: ${resp.headers.get('retry-after') || 'none'}`,
+                );
+              }
+            }
+
+            if (!retryable || attempt === BATCH_MAX_RETRIES) {
+              if (DEVELOPER_MODE && resp) {
+                try {
+                  const clonedResp = resp.clone();
+                  const text = await clonedResp.text();
+                  console.warn(`(Dev) [Diagnostics] Response Body: ${text.substring(0, 500)}`);
+                } catch {}
+              }
+              throw new Error(`Batch request failed for ${creatorKey}: ${statusText}`);
+            }
+
+            if (status === 429 && resp) {
+              const delayMs = getBatchRetryAfterMs(resp, attempt);
+              sendStatusMessage(
+                `Roblox rate limited download lookup. Retrying in ${Math.ceil(delayMs / 1000)}s...`,
+              );
+              if (DEVELOPER_MODE)
+                console.warn(`(Dev) Rate limited (429). Pausing batch globally for ${delayMs}ms`);
+              setBatchRateLimit(delayMs);
+            } else {
+              const delayMs = BATCH_RETRY_DELAY_MS + Math.floor(Math.random() * 300);
+              await new Promise((r) => setTimeout(r, delayMs));
+            }
+          }
+
+          if (!locations) throw new Error(`Batch request failed for ${creatorKey}: no response`);
+          if (DEVELOPER_MODE) console.log(`(Dev) Batch response for ${creatorKey}:`, locations);
+
+          const hasBatchErrors = locations.some(hasBatchAccessDeniedErrors);
+
+          const errorItems = locations.filter((loc) => loc.errors && loc.errors.length > 0);
+          if (errorItems.length > 0 && DEVELOPER_MODE) {
+            for (const locErr of errorItems) {
+              const firstErr = locErr.errors[0] || {};
+              console.warn(
+                `Batch error for ${locErr.requestId} at place ${placeId}:`,
+                JSON.stringify(firstErr),
+              );
+              console.log(
+                '(Dev) Full batch item with error:',
+                JSON.stringify(locErr, null, 2).substring(0, 500),
+              );
+            }
+          }
+
+          if (hasBatchErrors) {
+            for (const loc of locations) {
+              if (hasBatchLocationSuccess(loc)) setBatchLocation(locationsMap, loc);
+            }
+
+            if (placeIdIndex < placeIdArray.length - 1) {
               if (DEVELOPER_MODE)
                 console.log(
-                  `(Dev) All places exhausted for ${creatorKey}. Fetching fresh placeIds (retry ${retryCount}/${maxRetries})...`,
+                  `(Dev) Batch errors detected for ${creatorKey} with placeId ${placeId}. Trying next place...`,
                 );
-              try {
-                const freshPlaceIds = await retryAsync(
-                  () => getPlaceIdFromCreator(creatorType, creatorId, robloxCookie, maxPlaceIds),
-                  1,
-                  1000,
-                );
-                placeIdMap[creatorKey] = uniquePlaceIds(
-                  entryPlaceIdsByCreator[creatorKey],
-                  freshPlaceIds,
-                );
-                placeIdArray = placeIdMap[creatorKey];
-                placeIdIndex = 0;
+              placeIdIndex++;
+              continue;
+            } else {
+              if (retryCount < maxRetries) {
+                retryCount++;
                 if (DEVELOPER_MODE)
                   console.log(
-                    `(Dev) Got fresh placeIds for ${creatorKey}: ${placeIdArray.join(', ')}`,
+                    `(Dev) All places exhausted for ${creatorKey}. Fetching fresh placeIds (retry ${retryCount}/${maxRetries})...`,
                   );
-                continue;
-              } catch (refreshErr) {
+                try {
+                  const freshPlaceIds = await retryAsync(
+                    () => getPlaceIdFromCreator(creatorType, creatorId, robloxCookie, maxPlaceIds),
+                    1,
+                    1000,
+                  );
+                  placeIdMap[creatorKey] = uniquePlaceIds(
+                    entryPlaceIdsByCreator[creatorKey],
+                    freshPlaceIds,
+                  );
+                  placeIdArray = placeIdMap[creatorKey];
+                  placeIdIndex = 0;
+                  if (DEVELOPER_MODE)
+                    console.log(
+                      `(Dev) Got fresh placeIds for ${creatorKey}: ${placeIdArray.join(', ')}`,
+                    );
+                  continue;
+                } catch (refreshErr) {
+                  if (DEVELOPER_MODE)
+                    console.warn(
+                      `(Dev) Failed to refresh placeIds for ${creatorKey}: ${refreshErr.message}`,
+                    );
+                  for (const loc of locations) {
+                    setBatchLocation(locationsMap, loc);
+                  }
+                  if (
+                    locations.every(
+                      (loc) => !hasBatchLocationSuccess(loc) && hasBatchAccessDeniedErrors(loc),
+                    )
+                  ) {
+                    // All locations denied — private assets with wrong/missing place context,
+                    // NOT a cookie problem.
+                    hasPlaceContextError = true;
+                  }
+                  evictPlaceId(placeIdCacheEntries, creatorKey, placeId);
+                  break;
+                }
+              } else {
                 if (DEVELOPER_MODE)
-                  console.warn(
-                    `(Dev) Failed to refresh placeIds for ${creatorKey}: ${refreshErr.message}`,
+                  console.log(
+                    `(Dev) Max retries reached for ${creatorKey}, accepting batch errors`,
                   );
                 for (const loc of locations) {
                   setBatchLocation(locationsMap, loc);
@@ -2174,96 +2240,73 @@ async function handleSpooferAction(
                     (loc) => !hasBatchLocationSuccess(loc) && hasBatchAccessDeniedErrors(loc),
                   )
                 ) {
-                  // All locations denied — private assets with wrong/missing place context,
+                  // Max retries reached and all still access-denied — place context issue,
                   // NOT a cookie problem.
                   hasPlaceContextError = true;
                 }
                 evictPlaceId(placeIdCacheEntries, creatorKey, placeId);
                 break;
               }
-            } else {
-              if (DEVELOPER_MODE)
-                console.log(`(Dev) Max retries reached for ${creatorKey}, accepting batch errors`);
-              for (const loc of locations) {
-                setBatchLocation(locationsMap, loc);
-              }
-              if (
-                locations.every(
-                  (loc) => !hasBatchLocationSuccess(loc) && hasBatchAccessDeniedErrors(loc),
-                )
-              ) {
-                // Max retries reached and all still access-denied — place context issue,
-                // NOT a cookie problem.
-                hasPlaceContextError = true;
-              }
-              evictPlaceId(placeIdCacheEntries, creatorKey, placeId);
-              break;
             }
-          }
-        } else {
-          if (DEVELOPER_MODE)
-            console.log(`(Dev) Batch request successful for ${creatorKey} with placeId ${placeId}`);
-          for (const loc of locations) {
-            setBatchLocation(locationsMap, loc);
-            if (hasBatchLocationSuccess(loc) && loc.requestId && placeId) {
-              if (data.shareCacheData !== false && typeof fetch === 'function') {
-                try {
-                  fetch('https://ispoofermotion.com/api/cache', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      asset_id: String(loc.requestId),
-                      place_id: String(placeId),
-                    }),
-                  }).catch(() => {});
-                } catch {}
-              }
+          } else {
+            if (DEVELOPER_MODE)
+              console.log(
+                `(Dev) Batch request successful for ${creatorKey} with placeId ${placeId}`,
+              );
+            for (const loc of locations) {
+              setBatchLocation(locationsMap, loc);
             }
+            recordSuccessfulPlaceId(placeIdCacheEntries, creatorKey, placeId);
+            break;
           }
-          recordSuccessfulPlaceId(placeIdCacheEntries, creatorKey, placeId);
-          break;
+        }
+      } catch (error) {
+        console.error('Batch request error:', error);
+        const msg = error && error.message ? error.message : '';
+        if (/\b401\b|\b403\b/.test(msg)) {
+          hasAuthError = true;
+        }
+        sendStatusMessage(`Batch request failed: ${error.message}`);
+        for (const item of items) {
+          if (
+            !locationsMap[item.requestId] ||
+            locationsMap[item.requestId].errors?.[0]?.message ===
+              'Asset missing from batch response'
+          ) {
+            setBatchLocation(locationsMap, {
+              requestId: item.requestId,
+              errors: [{ message: msg }],
+            });
+          }
+
+          const transfer = initialTransferStates.find((t) => t.originalAssetId === item.requestId);
+          if (transfer)
+            sendTransferUpdate({
+              id: transfer.id,
+              status: 'error',
+              error: 'Batch request failed',
+            });
         }
       }
-    } catch (error) {
-      console.error('Batch request error:', error);
-      const msg = error && error.message ? error.message : '';
-      if (/\b401\b|\b403\b/.test(msg)) {
-        hasAuthError = true;
-      }
-      sendStatusMessage(`Batch request failed: ${error.message}`);
-      for (const item of items) {
-        if (
-          !locationsMap[item.requestId] ||
-          locationsMap[item.requestId].errors?.[0]?.message === 'Asset missing from batch response'
-        ) {
-          setBatchLocation(locationsMap, { requestId: item.requestId, errors: [{ message: msg }] });
-        }
 
-        const transfer = initialTransferStates.find((t) => t.originalAssetId === item.requestId);
-        if (transfer)
-          sendTransferUpdate({
-            id: transfer.id,
-            status: 'error',
-            error: 'Batch request failed',
-          });
-      }
-    }
-
-    resolvedLocationsCount += items.length;
-    sendSpooferProgress({
-      phase: 'locations',
-      current: resolvedLocationsCount,
-      total: batchItems.length,
+      resolvedLocationsCount += items.length;
+      sendSpooferProgress({
+        phase: 'locations',
+        current: resolvedLocationsCount,
+        total: batchItems.length,
+      });
+      sendStatusMessage(
+        `Resolved download locations ${resolvedLocationsCount}/${batchItems.length}`,
+      );
     });
-    sendStatusMessage(`Resolved download locations ${resolvedLocationsCount}/${batchItems.length}`);
-  });
 
-  // Save the updated placeId success cache to disk.
-  try {
-    await savePlaceIdCache(userDataPath, placeIdCacheEntries);
-    if (DEVELOPER_MODE) console.log('(Dev) Saved placeId cache');
-  } catch (cacheErr) {
-    if (DEVELOPER_MODE) console.warn('(Dev) Failed to save placeId cache:', cacheErr.message);
+    // Save the updated placeId success cache to disk.
+    try {
+      await savePlaceIdCache(userDataPath, placeIdCacheEntries);
+      if (DEVELOPER_MODE) console.log('(Dev) Saved placeId cache');
+    } catch (cacheErr) {
+      if (DEVELOPER_MODE) console.warn('(Dev) Failed to save placeId cache:', cacheErr.message);
+    }
   }
 
   const UPLOAD_RETRIES = parseInt(data.uploadRetries, 10) || 3;
@@ -2413,96 +2456,118 @@ async function handleSpooferAction(
       }
     };
 
-    if (loc?.locations && loc.locations.length > 0 && loc.locations[0].location) {
-      const batchLocation = loc.locations[0].location;
-      result = await tryDownloadUrl(
-        batchLocation,
-        null,
-        getPlaceIdFromDownloadUrl(batchLocation) || entryPlaceId,
-      );
-      if (!result?.success) {
-        batchErrorMessage = result?.error || 'Batch URL download failed';
-        if (DEVELOPER_MODE) {
-          console.log(
-            `(Dev) Batch URL download failed for ${entry.id}: ${batchErrorMessage}. Trying direct asset fallback...`,
-          );
-        }
-      }
-    }
-
-    if (!result?.success) {
-      batchErrorMessage = batchErrorMessage || extractBatchLocationError(loc);
-      if (DEVELOPER_MODE) {
-        console.log(
-          `(Dev) Batch location failed for ${entry.id}: ${batchErrorMessage}. Trying direct asset fallback...`,
+    if (useApiKey) {
+      try {
+        const url = await retryAsync(
+          () =>
+            robloxSession.resolveAssetUrl(entry.id, {
+              signal: AbortSignal.any([getAbortSignal(), AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS)]),
+            }),
+          DOWNLOAD_RETRIES + 1,
+          DOWNLOAD_RETRY_DELAY_MS,
         );
-      }
-
-      let scraperSuccess = false;
-      if (entryIsSound) {
-        const scrapedUrl = await getScrapedAssetCdnUrl(entry.id);
-        if (scrapedUrl) {
-          result = await tryDownloadUrl(
-            scrapedUrl,
-            'Batch lookup failed; trying CDN web scraper fallback',
-            getPlaceIdFromDownloadUrl(scrapedUrl),
-            true,
-          );
-          if (result && result.success) {
-            scraperSuccess = true;
-          }
-        }
-      }
-
-      if (!scraperSuccess) {
-        const directAttempts = buildDirectAssetDownloadAttempts(
-          entry.id,
-          normalizedEntryPlaceIds,
-          entryIsSound,
-        );
-        for (let index = 0; index < directAttempts.length; index += 1) {
-          checkCancelled();
-          await checkPaused();
-          const attempt = directAttempts[index];
-          result = await tryDownloadUrl(
-            attempt.url,
-            `Batch lookup failed; trying direct download fallback ${index + 1}/${directAttempts.length}`,
-            attempt.placeId,
-            true,
-          );
-          if (result.success) break;
-        }
-      }
-
-      if (!result || !result.success) {
-        const directError = result?.error || 'Direct download fallback failed';
-        const batchIsAccessDenied = /403|forbidden|not authorized|unauthorized|permission/i.test(
-          String(batchErrorMessage || ''),
-        );
-        const directIsAccessDenied = /403|forbidden|not authorized|unauthorized|permission/i.test(
-          directError,
-        );
-        const accessDenied = batchIsAccessDenied || directIsAccessDenied;
-        // Always show the place-context hint on any 403 — even if a placeId was supplied,
-        // it may be wrong or stale for this private asset.
-        const placeContextHint = accessDenied
-          ? ' Asset is private or restricted — re-import from the Studio plugin scan, or add [Place:<placeId>] / Override place ID for a game that has access to it.'
-          : '';
-        // Collapse both errors into one clean message when both are access-denied,
-        // otherwise keep the full dual-error message for debugging.
-        const combinedError =
-          batchIsAccessDenied && directIsAccessDenied
-            ? `Failed to download asset: Access denied (403).${placeContextHint}`
-            : `Batch error: ${batchErrorMessage}. Direct fallback: ${directError}.${placeContextHint}`;
-        result = {
-          success: false,
-          error: combinedError,
-        };
+        result = await tryDownloadUrl(url, 'Downloading through Open Cloud');
+      } catch (error) {
+        checkCancelled();
+        result = { success: false, error: error.message };
         sendTransferUpdate({
           id: downloadTransferId,
           status: 'error',
           error: result.error,
         });
+      }
+    } else {
+      if (loc?.locations && loc.locations.length > 0 && loc.locations[0].location) {
+        const batchLocation = loc.locations[0].location;
+        result = await tryDownloadUrl(
+          batchLocation,
+          null,
+          getPlaceIdFromDownloadUrl(batchLocation) || entryPlaceId,
+        );
+        if (!result?.success) {
+          batchErrorMessage = result?.error || 'Batch URL download failed';
+          if (DEVELOPER_MODE) {
+            console.log(
+              `(Dev) Batch URL download failed for ${entry.id}: ${batchErrorMessage}. Trying direct asset fallback...`,
+            );
+          }
+        }
+      }
+
+      if (!result?.success) {
+        batchErrorMessage = batchErrorMessage || extractBatchLocationError(loc);
+        if (DEVELOPER_MODE) {
+          console.log(
+            `(Dev) Batch location failed for ${entry.id}: ${batchErrorMessage}. Trying direct asset fallback...`,
+          );
+        }
+
+        let scraperSuccess = false;
+        if (entryIsSound) {
+          const scrapedUrl = await getScrapedAssetCdnUrl(entry.id);
+          if (scrapedUrl) {
+            result = await tryDownloadUrl(
+              scrapedUrl,
+              'Batch lookup failed; trying CDN web scraper fallback',
+              getPlaceIdFromDownloadUrl(scrapedUrl),
+              true,
+            );
+            if (result && result.success) {
+              scraperSuccess = true;
+            }
+          }
+        }
+
+        if (!scraperSuccess) {
+          const directAttempts = buildDirectAssetDownloadAttempts(
+            entry.id,
+            normalizedEntryPlaceIds,
+            entryIsSound,
+          );
+          for (let index = 0; index < directAttempts.length; index += 1) {
+            checkCancelled();
+            await checkPaused();
+            const attempt = directAttempts[index];
+            result = await tryDownloadUrl(
+              attempt.url,
+              `Batch lookup failed; trying direct download fallback ${index + 1}/${directAttempts.length}`,
+              attempt.placeId,
+              true,
+            );
+            if (result.success) break;
+          }
+        }
+
+        if (!result || !result.success) {
+          const directError = result?.error || 'Direct download fallback failed';
+          const batchIsAccessDenied = /403|forbidden|not authorized|unauthorized|permission/i.test(
+            String(batchErrorMessage || ''),
+          );
+          const directIsAccessDenied = /403|forbidden|not authorized|unauthorized|permission/i.test(
+            directError,
+          );
+          const accessDenied = batchIsAccessDenied || directIsAccessDenied;
+          // Always show the place-context hint on any 403 — even if a placeId was supplied,
+          // it may be wrong or stale for this private asset.
+          const placeContextHint = accessDenied
+            ? ' Asset is private or restricted — re-import from the Studio plugin scan, or add [Place:<placeId>] / Override place ID for a game that has access to it.'
+            : '';
+          // Collapse both errors into one clean message when both are access-denied,
+          // otherwise keep the full dual-error message for debugging.
+          const combinedError =
+            batchIsAccessDenied && directIsAccessDenied
+              ? `Failed to download asset: Access denied (403).${placeContextHint}`
+              : `Batch error: ${batchErrorMessage}. Direct fallback: ${directError}.${placeContextHint}`;
+          result = {
+            success: false,
+            error: combinedError,
+          };
+          sendTransferUpdate({
+            id: downloadTransferId,
+            status: 'error',
+            error: result.error,
+          });
+        }
       }
     }
 
@@ -2533,8 +2598,8 @@ async function handleSpooferAction(
     downloadOne,
   );
 
-  let authenticatedUserId = null;
-  if (!data.downloadOnly && data.apiKey && !data.groupId) {
+  let authenticatedUserId = useApiKey ? data.userId : null;
+  if (!useApiKey && !data.downloadOnly && data.apiKey && !data.groupId) {
     try {
       const ownerDetection = await detectOpenCloudApiKeyOwner(data.apiKey);
       if (ownerDetection.ok && ownerDetection.ownerUserId) {
@@ -2841,8 +2906,9 @@ async function handleSpooferAction(
 
     if (successfulDownloadsList) {
       finalOutput = `Downloaded ${downloadedSuccessfullyCount}/${animationEntries.length} assets to:\n${downloadsDir}\n\nFiles:\n${successfulDownloadsList}`;
+      if (downloadFailures.length) finalOutput += `\n${runSummary}`;
     } else {
-      finalOutput = 'No assets were successfully downloaded.';
+      finalOutput = `No assets were successfully downloaded.\n${runSummary}`;
     }
   } else if (uploadMappingOutput.trim()) {
     finalOutput = uploadMappingOutput.trim().replace(/,$/, '');
@@ -2945,9 +3011,16 @@ async function handleSpooferAction(
   }
 }
 
+async function getActiveAuthMode() {
+  const secrets = await loadProfileSecrets();
+  return secrets.profiles[secrets.activeProfileId]?.authMode || 'cookie';
+}
+
 module.exports = {
   registerIpcHandlers,
+  getActiveAuthMode,
   __private: {
+    handleSpooferAction,
     buildDirectAssetDownloadAttempts,
     buildDirectAssetDownloadUrls,
     extractBatchLocationError,

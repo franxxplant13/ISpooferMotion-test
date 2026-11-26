@@ -20,26 +20,8 @@ export class ErrorBoundary extends Component<Props, State> {
     return { hasError: true, error };
   }
 
-  public async componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    try {
-      const appVersion = await (window as any).electronAPI?.getAppVersion?.() || '1.0.0';
-      const osInfo = await (window as any).electronAPI?.getOsInfo?.() || 'Unknown OS';
-
-      await fetch('https://ispoofermotion.com/api/crash-reports', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          errorName: error.name,
-          errorMessage: error.message,
-          stackTrace: errorInfo.componentStack + '\n\n' + (error.stack || ''),
-          appVersion,
-          appType: 'V1',
-          osInfo,
-        }),
-      });
-    } catch (e) {
-      console.error('Failed to submit crash report:', e);
-    }
+  public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error('Renderer error:', error, errorInfo.componentStack);
   }
 
   public render() {
@@ -49,7 +31,7 @@ export class ErrorBoundary extends Component<Props, State> {
           <Text fontSize="3xl" fontWeight="bold" mb={4}>Oops, something broke.</Text>
           <Text color="discord.muted" maxW="md" mb={6}>
             ISpooferMotion encountered a fatal error and could not continue. 
-            A crash report has been silently sent to the developers.
+            Reload the application to try again.
           </Text>
           <Box bg="discord.card" p={4} borderRadius="md" maxW="2xl" w="full" textAlign="left" overflow="auto" maxH="48" fontFamily="monospace" fontSize="sm" mb={6}>
             <Text color="red.400" fontWeight="semibold">{this.state.error?.name}: {this.state.error?.message}</Text>

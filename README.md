@@ -19,6 +19,18 @@
 3. **Apply spoofing:** Use the official ISpooferMotion Roblox Studio plugin (linked above) to link and spoof animations in your game projects.
 4. **Spoofs** Spoofs animations inside of scripts and replaces them alongside replacing animation objects.
 
+## API-key mode and privacy in this fork
+
+Select **API key only** in the desktop app's Quick Setup to download through Open Cloud and upload animations or audio without a Roblox session cookie. New profiles select this mode by default. Existing profiles keep their previous cookie workflow until you switch modes.
+
+- Configure Asset Delivery access for downloads (`legacy-asset:manage` in Roblox's scope documentation), plus Assets Read and Write for uploads and upload status checks.
+- Enter your Roblox User ID for personal uploads, or a Group ID for group uploads. The key must have permission to upload for that creator.
+- Scan with the Studio plugin, start the operation, then use **Push to Studio** to apply the returned mappings. Back up the project before applying replacements.
+- API-key mode reports restricted assets as failures. Choose **Cookie + API key** explicitly if you need the existing download workflow. Audio quota previews and place-context search are available in cookie mode. Roblox still checks quotas during API-key uploads.
+- API keys are sensitive. Saved profiles currently store credentials in the app's local JSON file. Use a dedicated key with minimum permissions and revoke it when finished.
+
+This fork removes usage heartbeats, remote crash reporting, asset/place cache sharing, and remote maintenance configuration. Local logs and job history remain available on your computer. Update checks use this fork's GitHub releases. Asset operations contact Roblox, and the Studio plugin also downloads a public Roblox API description from GitHub.
+
 ## Installation
 
 Download the latest release executable from the [Releases](https://github.com/IncrediDev/ISpooferMotion/releases) section.

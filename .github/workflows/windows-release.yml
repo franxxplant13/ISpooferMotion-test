@@ -1,0 +1,107 @@
+name: Windows release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - package.json
+      - .github/workflows/windows-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: node scripts/ci-install.js
+
+      - name: Rebuild native dependencies
+        run: npm run rebuild:native
+
+      - name: Run tests
+        run: npm test
+
+      - name: Read version and configure unsigned fork build
+        id: version
+        shell: bash
+        run: |
+          node <<'JS'
+          const fs = require('node:fs');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${pkg.version}\n`);
+          delete pkg.build.win.azureSignOptions;
+          pkg.build.win.signAndEditExecutable = false;
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          JS
+
+      - name: Build Windows installer
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npm run build -- --win nsis --x64 --publish never
+
+      - name: Build Studio plugin
+        run: npm run build:plugin
+
+      - name: Prepare release notes and checksums
+        shell: bash
+        run: |
+          node <<'JS'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const path = require('node:path');
+          const files = fs.readdirSync('dist').filter(name => /^ISpooferMotion-(App.*\.exe|Plugin.*\.rbxmx)$/.test(name));
+          const checksums = files.map(name => {
+            const hash = crypto.createHash('sha256').update(fs.readFileSync(path.join('dist', name))).digest('hex');
+            return `${hash}  ${name}`;
+          });
+          fs.writeFileSync('dist/SHA256SUMS.txt', checksums.join('\n') + '\n');
+          fs.writeFileSync('dist/release-notes.md', [
+            'Adds API-key-only asset downloads and uploads, with Cookie mode available separately.',
+            'Removes usage telemetry, remote crash reports, shared asset/place reporting, and remote maintenance configuration.',
+            '',
+            'Download the Windows .exe installer and the matching .rbxmx Studio plugin below.',
+            'This fork build is unsigned. Windows may display an unknown publisher warning.',
+            'Live Roblox compatibility still needs testing. Saved profile credentials use local unencrypted JSON.',
+            '',
+            `Built from commit ${process.env.GITHUB_SHA}.`,
+          ].join('\n'));
+          JS
+          npm run release:verify-assets
+
+      - name: Preserve downloadable build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ISpooferMotion-Windows-${{ steps.version.outputs.version }}
+          path: |
+            dist/ISpooferMotion-App*.exe
+            dist/ISpooferMotion-Plugin*.rbxmx
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish Windows release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: v${{ steps.version.outputs.version }}
+          body_path: dist/release-notes.md
+          fail_on_unmatched_files: true
+          files: |
+            dist/ISpooferMotion-App*.exe
+            dist/ISpooferMotion-Plugin*.rbxmx
+            dist/SHA256SUMS.txt

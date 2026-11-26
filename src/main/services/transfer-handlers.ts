@@ -371,7 +371,7 @@ async function downloadAnimationAssetWithProgress(
 ) {
   const cookieHeader = robloxSession.getCookieHeader();
 
-  if (!cookieHeader) {
+  if (!cookieHeader && robloxSession.authType !== 'apiKey') {
     const error = 'Missing or invalid ROBLOSECURITY cookie';
     sendTransferUpdateSafe(sendTransferUpdate, {
       id: transferId,

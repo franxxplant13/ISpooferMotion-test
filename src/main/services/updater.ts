@@ -9,8 +9,8 @@ const { spawn } = require('child_process');
 
 
 const USER_AGENT = `ISpooferMotion-Electron-App/${app.getVersion()} (+https://github.com/IncrediDev/ISpooferMotion)`;
-const REPO_OWNER = 'IncrediDev';
-const REPO_NAME = 'ISpooferMotion';
+const REPO_OWNER = 'franxxplant13';
+const REPO_NAME = 'ISpooferMotion-test';
 const API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest`;
 const REQUEST_TIMEOUT_MS = 15000;
 
